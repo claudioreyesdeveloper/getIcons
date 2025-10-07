@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-Fetch icons from Flaticon via the official API.
+Fetch one icon per label from Flaticon via the official API.
 
-Requirements:
-  - Python 3.9+
-  - pip install requests
+Usage:
+  export FLATICON_API_KEY=...   # (in CI, set as Actions Secret)
+  python scripts/fetch_flaticon_batch.py \
+      --file queries.txt \
+      --format png \
+      --size 128 \
+      --out icons/
 
-Environment:
-  - FLATICON_API_KEY: your private API key (kept secret)
-Usage examples:
-  - python scripts/fetch_flaticon.py --query "api" --limit 10 --format png --size 128 --out icons/
-  - python scripts/fetch_flaticon.py --query "user" --limit 5 --format svg --out icons-svgs/
+Notes (matches Flaticon API v3 behavior):
+- Auth: POST /app/authentication with API key → temporal Bearer token (≈24h).
+- Search: GET /search/icons/{orderBy}?q=...&limit=...&page=...
+- Download: GET /item/icon/download/{id}?format=svg|png[&size=...]
 
-Notes (per Flaticon API v3 docs):
-  - Obtain a temporal bearer token via POST /app/authentication with your API key.
-  - Search icons via GET /search/icons/{orderBy}?q=... (orderBy: priority|added).
-  - Download via GET /item/icon/download/{id} with format, size, color, iconType parameters.
-    The docs list 'format' as a required parameter (documented as “path” in the spec);
-    in practice, many clients pass it as a query string (?format=svg|png). If one style
-    404s in your account, this script falls back to the other.
-References:
-  - API home: https://api.flaticon.com/v3/docs/index.html
+This script:
+- Reads labels from --file (one per line).
+- Normalizes each label to a reasonable search query (best effort).
+- Searches by priority order and takes the first result per label.
+- Downloads PNG (with size) or SVG to a stable filename derived from the original label.
+- Avoids unsafe characters in filenames; logs success/failure per label.
 """
 
 import argparse
@@ -29,15 +29,14 @@ import sys
 import time
 import pathlib
 import re
-import requests
 from typing import List, Dict
+import requests
 
 API_BASE = "https://api.flaticon.com/v3"
 
 def get_token(api_key: str) -> str:
-    # POST /app/authentication → { token, expires }
-    # Content type must be multipart/form-data per docs.
     url = f"{API_BASE}/app/authentication"
+    # Per docs, multipart/form-data with "apikey"
     resp = requests.post(url, files={"apikey": (None, api_key)}, headers={"Accept": "application/json"})
     if resp.status_code != 200:
         raise RuntimeError(f"Auth failed: {resp.status_code} {resp.text}")
@@ -47,85 +46,102 @@ def get_token(api_key: str) -> str:
         raise RuntimeError(f"Auth response missing token: {data}")
     return token
 
-def search_icons(token: str, query: str, order_by: str, limit: int) -> List[Dict]:
-    # GET /search/icons/{orderBy}?q=...&limit=...
+def safe_filename(text: str) -> str:
+    t = text.strip().lower()
+    t = t.replace("&", "and")
+    t = re.sub(r"[./]+", "-")  # dots/slashes → hyphen
+    t = re.sub(r"[^a-z0-9._ -]+", "", t)
+    t = re.sub(r"\s+", "-", t)
+    t = re.sub(r"-+", "-", t)
+    return t.strip("-") or "icon"
+
+def normalize_query(label: str) -> str:
+    raw = label.strip()
+    # Domain-specific, best-effort fixes and synonyms
+    fixes = {
+        "e.guitar": "electric guitar",
+        "e.piano": "electric piano",
+        "drumkit": "drum kit",
+        "sub category": "subcategory",
+        "choir&vocals": "choir vocals",
+        "church&christmas": "church christmas",
+        "euro dance": "eurodance",
+        "euro organ artist": "organ artist",
+        "fm xpanded": "fm expanded",
+        "japanes": "japanese",
+        "vietnamise": "vietnamese",
+        "bariton": "baritone",
+        "sa 2": "sa2",
+    }
+    key = raw.lower().strip()
+    # strip punctuation variants that often appear as separators
+    key = key.replace("–", "-").replace("—", "-")
+    # apply targeted replacements
+    for k, v in fixes.items():
+        if k in key:
+            key = key.replace(k, v)
+    # clean dotted abbreviations like "a.guitar" → "a guitar" (kept literal for search)
+    key = key.replace(".", " ")
+    # extra trims
+    key = re.sub(r"\s+", " ", key).strip()
+    return key or raw
+
+def search_first_icon(token: str, query: str, order_by: str = "priority") -> Dict:
     url = f"{API_BASE}/search/icons/{order_by}"
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
-    out = []
-    page = 1
-    while len(out) < limit:
-        params = {"q": query, "limit": min(100, limit - len(out)), "page": page}
-        r = requests.get(url, headers=headers, params=params)
-        if r.status_code != 200:
-            raise RuntimeError(f"Search error: {r.status_code} {r.text}")
-        payload = r.json()
-        items = payload.get("data", [])
-        if not items:
-            break
-        out.extend(items)
-        meta = payload.get("metadata", {})
-        if meta.get("page", 1) * 1 >= meta.get("total", meta.get("count", 0)) or len(items) == 0:
-            break
-        page += 1
-        time.sleep(0.2)  # be polite
-    return out[:limit]
+    params = {"q": query, "limit": 1, "page": 1}
+    r = requests.get(url, headers=headers, params=params)
+    if r.status_code != 200:
+        raise RuntimeError(f"Search error: {r.status_code} {r.text}")
+    data = r.json().get("data", [])
+    return data[0] if data else None
 
-def safe_filename(text: str) -> str:
-    text = text.strip().lower()
-    text = re.sub(r"[^a-z0-9._-]+", "-", text)
-    return re.sub(r"-+", "-", text).strip("-") or "icon"
-
-def download_icon(token: str, icon_id: int, fmt: str, size: int, dest_dir: pathlib.Path):
-    """
-    Try download endpoint first, then fall back to CDN PNG if available in search results (for PNG only).
-    Primary route (per docs):
-      GET /item/icon/download/{id}?format=svg|png&size=...&color=...&iconType=...
-    Some tenants may require format in the path; if the query version 404s, try /{id}/{format}.
-    """
+def download_icon(token: str, icon_id: int, fmt: str, size: int, dest_path: pathlib.Path):
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
-    # Query-parameter style
+    # Try query param style first
     url_q = f"{API_BASE}/item/icon/download/{icon_id}"
     params = {"format": fmt}
     if fmt == "png" and size:
         params["size"] = size
     r = requests.get(url_q, headers=headers, params=params)
     if r.status_code == 404:
-        # Path-parameter style fallback
+        # Fallback: path style
         url_p = f"{API_BASE}/item/icon/download/{icon_id}/{fmt}"
         r = requests.get(url_p, headers=headers, params={"size": size} if fmt == "png" and size else None)
     if r.status_code != 200:
         raise RuntimeError(f"Download error for {icon_id}: {r.status_code} {r.text}")
-    # API typically returns a JSON with a 'data' object and a 'url' to the asset
+
+    # Preferred: JSON envelope with data.url
+    u = None
     try:
         u = r.json()["data"]["url"]
     except Exception:
-        # Some accounts may get a direct file response; handle it.
-        if "Content-Type" in r.headers and ("image/" in r.headers["Content-Type"] or "svg" in r.headers["Content-Type"]):
-            # Save binary payload directly.
-            ext = "svg" if "svg" in r.headers["Content-Type"] else "png"
-            out = dest_dir / f"{icon_id}.{ext}"
-            out.write_bytes(r.content)
-            return str(out)
-        raise RuntimeError(f"Unexpected download response for {icon_id}: {r.text[:500]}")
-    # Fetch the asset from the returned CDN URL
-    asset = requests.get(u, stream=True)
-    asset.raise_for_status()
-    ext = "svg" if fmt == "svg" else "png"
-    out = dest_dir / f"{icon_id}.{ext}"
-    with open(out, "wb") as fh:
-        for chunk in asset.iter_content(8192):
-            fh.write(chunk)
-    return str(out)
+        pass
+
+    if u:
+        asset = requests.get(u, stream=True)
+        asset.raise_for_status()
+        with open(dest_path, "wb") as fh:
+            for chunk in asset.iter_content(8192):
+                fh.write(chunk)
+        return
+
+    # Direct binary fallback
+    if "Content-Type" in r.headers and ("image/" in r.headers["Content-Type"] or "svg" in r.headers["Content-Type"]):
+        dest_path.write_bytes(r.content)
+        return
+
+    raise RuntimeError(f"Unexpected download response for {icon_id}: {r.text[:500]}")
 
 def main():
-    p = argparse.ArgumentParser(description="Fetch Flaticon icons via official API.")
-    p.add_argument("--query", required=True, help="Search term, e.g., 'api'")
-    p.add_argument("--limit", type=int, default=10, help="Max icons to fetch")
-    p.add_argument("--format", choices=["png", "svg"], default="png", help="Download format")
-    p.add_argument("--size", type=int, default=128, help="PNG size (16,24,32,64,128,256,512). Ignored for SVG.")
-    p.add_argument("--order", choices=["priority", "added"], default="priority", help="Search order")
-    p.add_argument("--out", default="icons", help="Output directory")
-    args = p.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--file", required=True, help="Path to a text file with one label per line")
+    ap.add_argument("--format", choices=["png", "svg"], default="png", help="Download format")
+    ap.add_argument("--size", type=int, default=128, help="PNG size (ignored for SVG)")
+    ap.add_argument("--order", choices=["priority", "added"], default="priority", help="Search order")
+    ap.add_argument("--out", default="icons", help="Output directory")
+    ap.add_argument("--delay-ms", type=int, default=200, help="Delay between API calls (ms)")
+    args = ap.parse_args()
 
     api_key = os.getenv("FLATICON_API_KEY")
     if not api_key:
@@ -136,23 +152,42 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     token = get_token(api_key)
-    results = search_icons(token, args.query, args.order, args.limit)
 
-    print(f"Found {len(results)} results; downloading up to {args.limit}…")
-    downloaded = 0
-    for item in results:
-        icon_id = item.get("id")
-        if not icon_id:
-            continue
+    labels: List[str] = []
+    with open(args.file, "r", encoding="utf-8") as fh:
+        for line in fh:
+            s = line.strip()
+            if s and not s.startswith("#"):
+                labels.append(s)
+
+    successes, failures = 0, 0
+    for label in labels:
+        q = normalize_query(label)
+        filename_base = safe_filename(label)
+        ext = "svg" if args.format == "svg" else "png"
+        dest_path = out_dir / f"{filename_base}.{ext}"
+
         try:
-            path = download_icon(token, icon_id, args.format, args.size, out_dir)
-            downloaded += 1
-            print(f"✔ {icon_id} → {path}")
+            icon = search_first_icon(token, q, order_by=args.order)
+            if not icon:
+                failures += 1
+                print(f"MISS | label='{label}' | query='{q}' | reason=no results", file=sys.stderr)
+            else:
+                icon_id = icon.get("id")
+                if not icon_id:
+                    failures += 1
+                    print(f"MISS | label='{label}' | query='{q}' | reason=missing id", file=sys.stderr)
+                else:
+                    download_icon(token, icon_id, args.format, args.size, dest_path)
+                    successes += 1
+                    print(f"OK   | label='{label}' | query='{q}' | id={icon_id} | → {dest_path}")
         except Exception as e:
-            print(f"✖ {icon_id} → {e}", file=sys.stderr)
-        time.sleep(0.15)
+            failures += 1
+            print(f"ERR  | label='{label}' | query='{q}' | {e}", file=sys.stderr)
 
-    print(f"Done. Downloaded {downloaded} file(s) to {out_dir}")
+        time.sleep(max(0.0, args.delay-ms / 1000.0))
+
+    print(f"Done. {successes} succeeded, {failures} failed. Output: {out_dir}")
 
 if __name__ == "__main__":
     main()
