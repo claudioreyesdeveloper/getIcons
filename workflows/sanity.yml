@@ -1,0 +1,10 @@
+# .github/workflows/sanity.yml
+name: Sanity Check
+on:
+  workflow_dispatch:
+
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Actions are enabled."
